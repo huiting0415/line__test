@@ -48,9 +48,17 @@ st.caption("上傳 LINE 對話紀錄，自動去敏感化並產出業務分類�
 with st.sidebar:
     st.header("⚙️ 設定")
 
+    # 若部署在 Streamlit Cloud 且已設定 secrets，會自動帶入預設 Key
+    # 本機執行時若無 secrets 設定，會安全地略過不報錯
+    try:
+        default_api_key = st.secrets.get("GEMINI_API_KEY", "")
+    except Exception:
+        default_api_key = ""
+
     api_key = st.text_input(
         "Google Gemini API Key",
         type="password",
+        value=default_api_key,
         help="從 https://aistudio.google.com/apikey 免費取得（不需信用卡），僅在本次執行期間使用，不會被儲存。",
     )
 
@@ -94,16 +102,31 @@ with st.expander("沒有檔案？點此下載模擬範例資料測試系統"):
     st.markdown(
         "範例資料為**模擬生成**，不含任何真實客戶資訊，可安全用於測試本系統。"
     )
-    try:
-        with open("sample_line_conversations.csv", "rb") as f:
-            st.download_button(
-                "下載範例 CSV",
-                data=f,
-                file_name="sample_line_conversations.csv",
-                mime="text/csv",
-            )
-    except FileNotFoundError:
-        st.info("請將 sample_line_conversations.csv 放在與 app.py 相同的資料夾")
+    col_sample1, col_sample2 = st.columns(2)
+    with col_sample1:
+        st.markdown("**基本版**（僅客戶對話，測試業務分類/商機/風險）")
+        try:
+            with open("sample_line_conversations.csv", "rb") as f:
+                st.download_button(
+                    "下載基本範例 CSV",
+                    data=f,
+                    file_name="sample_line_conversations.csv",
+                    mime="text/csv",
+                )
+        except FileNotFoundError:
+            st.info("請將 sample_line_conversations.csv 放在與 app.py 相同的資料夾")
+    with col_sample2:
+        st.markdown("**進階版**（含同事回覆與時間戳記，可測試同事表現分析）")
+        try:
+            with open("sample_line_conversations_v2.csv", "rb") as f:
+                st.download_button(
+                    "下載進階範例 CSV",
+                    data=f,
+                    file_name="sample_line_conversations_v2.csv",
+                    mime="text/csv",
+                )
+        except FileNotFoundError:
+            st.info("請將 sample_line_conversations_v2.csv 放在與 app.py 相同的資料夾")
 
 
 # =========================================================
@@ -208,6 +231,88 @@ def analyze_batch(model: genai.GenerativeModel, batch_df: pd.DataFrame, text_col
 
 
 # =========================================================
+# 同事回覆表現分析：配對「客戶問題→同事回覆」並計算回覆時間
+# =========================================================
+def compute_response_pairs(df: pd.DataFrame, name_col: str, staff_col: str, time_col: str, text_col: str) -> pd.DataFrame:
+    """
+    採用簡化假設：資料以時間順序排列，且每一則同事回覆的「上一列」即為對應的客戶提問。
+    若資料並非嚴格一問一答排列，結果僅供參考。
+    """
+    df = df.copy()
+    df["_parsed_time"] = pd.to_datetime(df[time_col], errors="coerce")
+    df["_customer_thread"] = df[name_col].replace("", pd.NA).ffill()
+
+    pairs = []
+    for i in range(1, len(df)):
+        cur = df.iloc[i]
+        prev = df.iloc[i - 1]
+
+        is_staff_reply = pd.notna(cur[staff_col]) and str(cur[staff_col]).strip() != ""
+        is_prev_customer_msg = pd.notna(prev[name_col]) and str(prev[name_col]).strip() != "" and \
+                                (pd.isna(prev[staff_col]) or str(prev[staff_col]).strip() == "")
+
+        if is_staff_reply and is_prev_customer_msg and pd.notna(cur["_parsed_time"]) and pd.notna(prev["_parsed_time"]):
+            response_minutes = (cur["_parsed_time"] - prev["_parsed_time"]).total_seconds() / 60
+            if response_minutes >= 0:
+                pairs.append({
+                    "staff_name": cur[staff_col],
+                    "customer_name": cur["_customer_thread"],
+                    "question_text": prev[text_col],
+                    "reply_text": cur[text_col],
+                    "response_minutes": round(response_minutes, 1),
+                })
+
+    return pd.DataFrame(pairs)
+
+
+STAFF_QUALITY_SYSTEM_PROMPT = """你是一家「會計師事務所暨商務中心」的客服品質稽核員。
+請針對輸入的每一組「客戶提問 → 同事回覆」，評估回覆品質，並「只回傳 JSON 陣列」，不要有任何其他文字、不要用 markdown code block 包住。
+
+每筆請輸出以下欄位：
+- index: 對應輸入的序號（整數）
+- tone: 語氣分類，必須是以下其中一種："親切專業", "中性/一般", "罐頭感/敷衍", "不耐煩/生硬"
+- quality_score: 1到5的整數，5分表示完整回答問題且態度良好，1分表示答非所問或態度不佳
+- issue_note: 若有明顯問題（如答非所問、態度不佳、資訊錯誤），用10字以內簡短說明，否則為空字串
+
+範例輸出格式：
+[{"index": 0, "tone": "親切專業", "quality_score": 5, "issue_note": ""}]
+"""
+
+
+def analyze_staff_quality_batch(model: genai.GenerativeModel, batch_df: pd.DataFrame) -> list:
+    """將一批「提問→回覆」配對送進 Gemini，評估語氣與品質"""
+    items = []
+    for i, row in enumerate(batch_df.itertuples()):
+        items.append(f"{i}: 客戶問：{row.question_text}\n    同事回：{row.reply_text}")
+
+    user_prompt = "以下是本批次的提問與回覆配對，請依格式評估每一筆：\n\n" + "\n\n".join(items)
+
+    response = model.generate_content(
+        [STAFF_QUALITY_SYSTEM_PROMPT, user_prompt],
+        generation_config={
+            "temperature": 0,
+            "response_mime_type": "application/json",
+        },
+    )
+
+    raw_text = response.text.strip()
+    raw_text = re.sub(r"^```(json)?", "", raw_text.strip())
+    raw_text = re.sub(r"```$", "", raw_text.strip())
+
+    try:
+        parsed = json.loads(raw_text)
+        if isinstance(parsed, dict):
+            for v in parsed.values():
+                if isinstance(v, list):
+                    parsed = v
+                    break
+        return parsed
+    except json.JSONDecodeError:
+        st.warning("同事表現分析有一批資料解析失敗，已略過該批次")
+        return []
+
+
+# =========================================================
 # 主流程
 # =========================================================
 if uploaded_file is not None:
@@ -241,6 +346,32 @@ if uploaded_file is not None:
             index=list(df_raw.columns).index(guess_column(df_raw, ["對話", "內容", "訊息", "content", "message"])),
         )
 
+    st.markdown("**以下兩個欄位為選填，若要分析「同事回覆速度／品質」才需要設定：**")
+    col4, col5 = st.columns(2)
+    with col4:
+        staff_col_options = ["(不分析同事表現)"] + list(df_raw.columns)
+        default_staff = guess_column(df_raw, ["同事", "回覆人", "客服", "員工", "staff"])
+        staff_col = st.selectbox(
+            "同事/回覆人姓名欄位",
+            staff_col_options,
+            index=staff_col_options.index(default_staff) if default_staff in staff_col_options else 0,
+        )
+    with col5:
+        time_col_options = ["(不分析同事表現)"] + list(df_raw.columns)
+        default_time = guess_column(df_raw, ["時間", "日期", "time", "date"])
+        time_col = st.selectbox(
+            "精確時間欄位（需含時分）",
+            time_col_options,
+            index=time_col_options.index(default_time) if default_time in time_col_options else 0,
+        )
+
+    analyze_staff_performance = staff_col != "(不分析同事表現)" and time_col != "(不分析同事表現)"
+    if analyze_staff_performance:
+        st.caption(
+            "⚠️ 這項分析涉及同事個人表現，建議先讓同事知情，並將結果用於輔導改進而非考核處罰，"
+            "以免影響團隊信任。"
+        )
+
     # 去敏感化
     st.subheader("③ 資料去敏感化")
     df_masked = df_raw.copy()
@@ -267,8 +398,15 @@ if uploaded_file is not None:
         genai.configure(api_key=api_key)
         model = genai.GenerativeModel(model_name)
 
+        # 若有設定同事欄位，CDP業務分類只分析「客戶訊息」，排除同事回覆列
+        if analyze_staff_performance:
+            is_customer_row = df_masked[staff_col].isna() | (df_masked[staff_col].astype(str).str.strip() == "")
+            df_for_category = df_masked[is_customer_row].reset_index(drop=True)
+        else:
+            df_for_category = df_masked
+
         all_results = []
-        total_rows = len(df_masked)
+        total_rows = len(df_for_category)
         n_batches = (total_rows + batch_size - 1) // batch_size
 
         progress_bar = st.progress(0, text="分析中...")
@@ -276,7 +414,7 @@ if uploaded_file is not None:
         for b in range(n_batches):
             start = b * batch_size
             end = min(start + batch_size, total_rows)
-            batch_df = df_masked.iloc[start:end]
+            batch_df = df_for_category.iloc[start:end]
 
             batch_result = analyze_batch(model, batch_df, text_col)
 
@@ -285,8 +423,8 @@ if uploaded_file is not None:
                 if idx is not None and 0 <= idx < len(batch_df):
                     global_idx = start + idx
                     item["global_index"] = global_idx
-                    item["customer_name"] = df_masked.iloc[global_idx][name_col]
-                    item["original_text"] = df_masked.iloc[global_idx][text_col]
+                    item["customer_name"] = df_for_category.iloc[global_idx][name_col]
+                    item["original_text"] = df_for_category.iloc[global_idx][text_col]
                     all_results.append(item)
 
             progress_bar.progress((b + 1) / n_batches, text=f"分析中... 第 {b+1}/{n_batches} 批")
@@ -300,7 +438,44 @@ if uploaded_file is not None:
 
         result_df = pd.DataFrame(all_results)
         st.session_state["result_df"] = result_df
-        st.success(f"分析完成！共成功分析 {len(result_df)} / {total_rows} 筆對話")
+        st.success(f"分析完成！共成功分析 {len(result_df)} / {total_rows} 筆客戶訊息")
+
+        # ---- 同事回覆表現分析（若有設定欄位）----
+        if analyze_staff_performance:
+            with st.spinner("正在分析同事回覆速度與品質..."):
+                pairs_df = compute_response_pairs(df_masked, name_col, staff_col, time_col, text_col)
+
+                if len(pairs_df) == 0:
+                    st.warning("找不到可配對的「客戶問題→同事回覆」，請確認資料排序是否為一問一答，或欄位選擇是否正確")
+                else:
+                    quality_results = []
+                    n_qbatches = (len(pairs_df) + batch_size - 1) // batch_size
+                    q_progress = st.progress(0, text="分析同事回覆品質中...")
+
+                    for b in range(n_qbatches):
+                        start = b * batch_size
+                        end = min(start + batch_size, len(pairs_df))
+                        batch_pairs = pairs_df.iloc[start:end]
+
+                        batch_q_result = analyze_staff_quality_batch(model, batch_pairs)
+
+                        for item in batch_q_result:
+                            idx = item.get("index")
+                            if idx is not None and 0 <= idx < len(batch_pairs):
+                                global_idx = start + idx
+                                item["staff_name"] = pairs_df.iloc[global_idx]["staff_name"]
+                                item["customer_name"] = pairs_df.iloc[global_idx]["customer_name"]
+                                item["response_minutes"] = pairs_df.iloc[global_idx]["response_minutes"]
+                                item["question_text"] = pairs_df.iloc[global_idx]["question_text"]
+                                item["reply_text"] = pairs_df.iloc[global_idx]["reply_text"]
+                                quality_results.append(item)
+
+                        q_progress.progress((b + 1) / n_qbatches, text=f"分析同事回覆品質中... 第 {b+1}/{n_qbatches} 批")
+                        time.sleep(4)
+
+                    q_progress.empty()
+                    st.session_state["staff_quality_df"] = pd.DataFrame(quality_results)
+                    st.success(f"同事回覆表現分析完成！共分析 {len(quality_results)} 組提問回覆配對")
 
     # =========================================================
     # Step 5：顯示分析結果
@@ -321,8 +496,11 @@ if uploaded_file is not None:
             names="業務分類",
             values="件數",
             hole=0.4,
+            template="plotly_white",
+            color_discrete_sequence=["#1F4E5F", "#4A90A4", "#8FBCC7", "#C4DDE3", "#D9D9D9"],
         )
         fig.update_traces(textinfo="percent+label")
+        fig.update_layout(font=dict(color="#1A1A1A"), plot_bgcolor="white", paper_bgcolor="white")
         st.plotly_chart(fig, use_container_width=True)
 
         col_a, col_b = st.columns(2)
@@ -376,6 +554,95 @@ if uploaded_file is not None:
             file_name="cdp_analysis_result.csv",
             mime="text/csv",
         )
+
+    # =========================================================
+    # Step 6：同事回覆表現分析儀表板
+    # =========================================================
+    if "staff_quality_df" in st.session_state:
+        staff_df = st.session_state["staff_quality_df"]
+
+        st.divider()
+        st.header("👥 同事回覆表現分析")
+        st.caption("此分析結果建議用於團隊輔導與流程改善，避免直接作為個人考核依據。")
+
+        if len(staff_df) == 0:
+            st.info("尚無可分析的同事回覆資料")
+        else:
+            col_c, col_d = st.columns(2)
+
+            # ---- 平均回覆時間 by 同事 ----
+            with col_c:
+                st.subheader("⏱️ 平均回覆時間（分鐘）")
+                avg_time = staff_df.groupby("staff_name")["response_minutes"].mean().round(1).reset_index()
+                avg_time.columns = ["同事", "平均回覆時間(分鐘)"]
+                avg_time = avg_time.sort_values("平均回覆時間(分鐘)", ascending=False)
+
+                fig_time = px.bar(
+                    avg_time,
+                    x="同事",
+                    y="平均回覆時間(分鐘)",
+                    text="平均回覆時間(分鐘)",
+                    template="plotly_white",
+                    color_discrete_sequence=["#1F4E5F"],
+                )
+                fig_time.update_layout(font=dict(color="#1A1A1A"), plot_bgcolor="white", paper_bgcolor="white")
+                st.plotly_chart(fig_time, use_container_width=True)
+
+            # ---- 平均品質分數 by 同事 ----
+            with col_d:
+                st.subheader("⭐ 平均回覆品質分數（1-5分）")
+                avg_quality = staff_df.groupby("staff_name")["quality_score"].mean().round(2).reset_index()
+                avg_quality.columns = ["同事", "平均品質分數"]
+                avg_quality = avg_quality.sort_values("平均品質分數", ascending=False)
+
+                fig_quality = px.bar(
+                    avg_quality,
+                    x="同事",
+                    y="平均品質分數",
+                    text="平均品質分數",
+                    range_y=[0, 5],
+                    template="plotly_white",
+                    color_discrete_sequence=["#4A90A4"],
+                )
+                fig_quality.update_layout(font=dict(color="#1A1A1A"), plot_bgcolor="white", paper_bgcolor="white")
+                st.plotly_chart(fig_quality, use_container_width=True)
+
+            # ---- 語氣分布 ----
+            st.subheader("🗣️ 語氣分布（依同事）")
+            tone_pivot = pd.crosstab(staff_df["staff_name"], staff_df["tone"])
+            st.dataframe(tone_pivot, use_container_width=True)
+
+            # ---- 待改善清單：回覆過慢或語氣不佳 ----
+            st.subheader("🔍 待關注案例（回覆過慢／語氣不佳）")
+            slow_threshold = staff_df["response_minutes"].quantile(0.75)
+            flagged = staff_df[
+                (staff_df["response_minutes"] > slow_threshold) |
+                (staff_df["tone"].isin(["罐頭感/敷衍", "不耐煩/生硬"])) |
+                (staff_df["quality_score"] <= 2)
+            ][["staff_name", "customer_name", "response_minutes", "tone", "quality_score", "issue_note", "question_text", "reply_text"]].rename(columns={
+                "staff_name": "同事",
+                "customer_name": "客戶",
+                "response_minutes": "回覆時間(分鐘)",
+                "tone": "語氣",
+                "quality_score": "品質分數",
+                "issue_note": "問題說明",
+                "question_text": "客戶提問",
+                "reply_text": "同事回覆",
+            })
+
+            if len(flagged) > 0:
+                st.dataframe(flagged, use_container_width=True, hide_index=True)
+            else:
+                st.caption("本批資料未發現明顯待改善案例")
+
+            # ---- 下載同事表現分析結果 ----
+            staff_csv_output = staff_df.to_csv(index=False).encode("utf-8-sig")
+            st.download_button(
+                "📥 下載同事回覆表現分析 (CSV)",
+                data=staff_csv_output,
+                file_name="staff_performance_analysis.csv",
+                mime="text/csv",
+            )
 
 else:
     st.info("👆 請先上傳 LINE 對話紀錄檔案，或使用上方的模擬範例資料測試系統")
